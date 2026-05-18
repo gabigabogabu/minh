@@ -40,13 +40,14 @@ function formatUsage(usage: LanguageModelUsage) {
 }
 
 const helpText = `Usage:
-  minh [-y|-n] [-c <chat-file>] [-m <model>] <prompt>
+  minh [-y] [--new-chat] [-c <chat-file>] [-m <model>] <prompt>
   minh --list-models [filter]
 Options:
   -c, --chat <path>  Path to the .chat file
   -m, --model <id>   OpenRouter model id (default: openrouter/free)
   -y, --yes          Run tools without asking for permission
       --list-models  List OpenRouter model ids, optionally filtered
+      --new-chat     Start a new timestamped .chat file instead of using the latest
   -h, --help         Show help`;
 
 export function parseCliArgs(args = Bun.argv.slice(2)) {
@@ -58,11 +59,12 @@ export function parseCliArgs(args = Bun.argv.slice(2)) {
       model: { type: "string", short: "m" },
       yes: { type: "boolean", short: "y" },
       "list-models": { type: "boolean" },
+      "new-chat": { type: "boolean" },
     },
     allowPositionals: true,
   });
   const { values, positionals } = parsed;
-  const { chat, help, model, yes, "list-models": listModels } = values;
+  const { chat, help, model, yes, "list-models": listModels, "new-chat": newChat } = values;
   const [prompt, extra] = positionals;
 
   if (help) return { help: true } as const;
@@ -72,8 +74,10 @@ export function parseCliArgs(args = Bun.argv.slice(2)) {
     throw new UsageError("Missing required positional argument: prompt");
   if (extra !== undefined)
     throw new UsageError(`Expected one prompt, received ${positionals.length}`);
+  if (chat !== undefined && newChat)
+    throw new UsageError("--chat and --new-chat cannot be used together");
 
-  return { chatPath: chat, model, prompt, yes };
+  return { chatPath: chat, model, prompt, yes, newChat };
 }
 
 const timestampChat = /^(\d+)\.chat$/;
@@ -83,8 +87,15 @@ function chatTimestamp(file: string) {
   return match ? Number.parseInt(match[1]!, 10) : undefined;
 }
 
-async function resolveChatPath(chatPath?: string) {
+async function createTimestampChat() {
+  const next = `./${Date.now()}.chat`;
+  await writeFile(next, "", { flag: "wx" });
+  return { path: next, defaulted: true };
+}
+
+async function resolveChatPath(chatPath?: string, newChat = false) {
   if (chatPath) return { path: chatPath, defaulted: false };
+  if (newChat) return createTimestampChat();
 
   const latest = (await readdir("."))
     .map(file => ({ file, timestamp: chatTimestamp(file) }))
@@ -93,9 +104,7 @@ async function resolveChatPath(chatPath?: string) {
 
   if (latest) return { path: `./${latest.file}`, defaulted: true };
 
-  const next = `./${Date.now()}.chat`;
-  await writeFile(next, "", { flag: "wx" });
-  return { path: next, defaulted: true };
+  return createTimestampChat();
 }
 
 async function listModels(filter?: string[]) {
@@ -176,8 +185,8 @@ done`,
   }),
 }; }
 
-async function runPrompt(args: { chatPath?: string; model?: string; prompt: string; yes?: boolean }) {
-  const { path: chatPath, defaulted: defaultedChat } = await resolveChatPath(args.chatPath);
+async function runPrompt(args: { chatPath?: string; model?: string; prompt: string; yes?: boolean; newChat?: boolean }) {
+  const { path: chatPath, defaulted: defaultedChat } = await resolveChatPath(args.chatPath, args.newChat);
   const model = args.model ?? defaultModel;
 
   if (defaultedChat) console.error(`Using chat file: ${chatPath}`);
