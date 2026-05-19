@@ -2,8 +2,18 @@
 
 MINimial Harness is a very small llm harness. Based on bun, ai sdk and openrouter.
 
+## Usage
+
+Skip Permissions
+
+`% yes | ./minh.ts "What's in this dir?"`
+
+List Models
+
+`% ./minh.ts --list-models | grep openai`
+
 ```sh
-% ./minh.ts --new-chat "What's in this dir?"
+% ./minh.ts "What's in this dir?"
 Using chat file: ./1779141354787.chat
 Using model: openrouter/free
 
@@ -58,6 +68,3 @@ Usage: 957 tokens
   input:  698 (698 new, 0 cached read, 0 cached write)
   output: 259 (163 text, 96 reasoning)
 ```
-
-Skip Permissions
-`% yes | ./minh.ts --new-chat "What's in this dir?"`
