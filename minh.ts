@@ -1,12 +1,11 @@
 #!/usr/bin/env bun
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { OpenRouter } from "@openrouter/sdk";
-import { addToolInputExamplesMiddleware, stepCountIs, streamText, tool, wrapLanguageModel, type LanguageModelUsage, type ModelMessage } from "ai";
+import { stepCountIs, streamText, tool, type ModelMessage } from "ai";
 import { appendFile, readdir, writeFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import readline from "node:readline";
 import * as z from 'zod';
-import type { WriteStream } from "node:tty";
 import path from "node:path";
 
 const defaultModel = "openrouter/free";
@@ -16,36 +15,12 @@ const shellOutputLimit = 10_000;
 const tailText = (text: string) =>
   text.length > shellOutputLimit ? `truncated, last ${shellOutputLimit} chars:\n${text.slice(-shellOutputLimit)}` : text;
 
-const formatTokens = (tokens: number | undefined) =>
-  tokens === undefined ? "?" : tokens.toLocaleString("en-US");
-
-function formatUsage(usage: LanguageModelUsage) {
-  const inputDetails = usage.inputTokenDetails;
-  const outputDetails = usage.outputTokenDetails;
-  const cacheReadTokens = inputDetails.cacheReadTokens ?? usage.cachedInputTokens;
-  const reasoningTokens = outputDetails.reasoningTokens ?? usage.reasoningTokens;
-
-  const inputBreakdown = [
-    inputDetails.noCacheTokens === undefined ? undefined : `${formatTokens(inputDetails.noCacheTokens)} new`,
-    cacheReadTokens === undefined ? undefined : `${formatTokens(cacheReadTokens)} cached read`,
-    inputDetails.cacheWriteTokens === undefined ? undefined : `${formatTokens(inputDetails.cacheWriteTokens)} cached write`,
-  ].filter(Boolean).join(", ");
-
-  const outputBreakdown = [
-    outputDetails.textTokens === undefined ? undefined : `${formatTokens(outputDetails.textTokens)} text`,
-    reasoningTokens === undefined ? undefined : `${formatTokens(reasoningTokens)} reasoning`,
-  ].filter(Boolean).join(", ");
-
-  return `Usage: ${formatTokens(usage.totalTokens)} tokens\n  input:  ${formatTokens(usage.inputTokens)}${inputBreakdown ? ` (${inputBreakdown})` : ""}\n  output: ${formatTokens(usage.outputTokens)}${outputBreakdown ? ` (${outputBreakdown})` : ""}`;
-}
-
 const helpText = `Usage:
-  minh [-y] [--new-chat] [-c <chat-file>] [-m <model>] <prompt>
+  minh [--new-chat] [-c <chat-file>] [-m <model>] <prompt>
   minh --list-models [filter]
 Options:
   -c, --chat <path>  Path to the .chat file
   -m, --model <id>   OpenRouter model id (default: openrouter/free)
-  -y, --yes          Run tools without asking for permission
       --list-models  List OpenRouter model ids, optionally filtered
       --new-chat     Start a new timestamped .chat file instead of using the latest
   -h, --help         Show help`;
@@ -57,14 +32,13 @@ export function parseCliArgs(args = Bun.argv.slice(2)) {
       chat: { type: "string", short: "c" },
       help: { type: "boolean", short: "h" },
       model: { type: "string", short: "m" },
-      yes: { type: "boolean", short: "y" },
       "list-models": { type: "boolean" },
       "new-chat": { type: "boolean" },
     },
     allowPositionals: true,
   });
   const { values, positionals } = parsed;
-  const { chat, help, model, yes, "list-models": listModels, "new-chat": newChat } = values;
+  const { chat, help, model, "list-models": listModels, "new-chat": newChat } = values;
   const [prompt, extra] = positionals;
 
   if (help) return { help: true } as const;
@@ -77,15 +51,10 @@ export function parseCliArgs(args = Bun.argv.slice(2)) {
   if (chat !== undefined && newChat)
     throw new UsageError("--chat and --new-chat cannot be used together");
 
-  return { chatPath: chat, model, prompt, yes, newChat };
+  return { chatPath: chat, model, prompt, newChat };
 }
 
 const timestampChat = /^(\d+)\.chat$/;
-
-function chatTimestamp(file: string) {
-  const match = timestampChat.exec(file);
-  return match ? Number.parseInt(match[1]!, 10) : undefined;
-}
 
 async function createTimestampChat() {
   const next = `./${Date.now()}.chat`;
@@ -97,12 +66,8 @@ async function resolveChatPath(chatPath?: string, newChat = false) {
   if (chatPath) return { path: chatPath, defaulted: false };
   if (newChat) return createTimestampChat();
 
-  const latest = (await readdir("."))
-    .map(file => ({ file, timestamp: chatTimestamp(file) }))
-    .filter((entry): entry is { file: string; timestamp: number } => entry.timestamp !== undefined)
-    .sort((a, b) => b.timestamp - a.timestamp || b.file.localeCompare(a.file))[0];
-
-  if (latest) return { path: `./${latest.file}`, defaulted: true };
+  const latest = (await readdir(".")).filter(file => timestampChat.test(file)).sort().at(-1);
+  if (latest) return { path: `./${latest}`, defaulted: true };
 
   return createTimestampChat();
 }
@@ -116,60 +81,44 @@ async function listModels(filter?: string[]) {
 }
 
 async function loadMessages(chatPath: string, prompt: string) {
-  const lines = (await Bun.file(chatPath).text()).split("\n").filter(line => line.trim());
-  const messages: ModelMessage[] = [];
-
-  for (const line of lines)
-    messages.push(JSON.parse(line));
-
+  const messages = (await Bun.file(chatPath).text())
+    .split("\n")
+    .filter(line => line.trim())
+    .reduce((msgs, l) => {msgs.push(JSON.parse(l)); return msgs}, [] as ModelMessage[])
   messages.push({ role: "user", content: prompt });
-  return { messages };
+  return messages;
 }
 
-async function appendMessages(chatPath: string, messages: ModelMessage[]) {
-  await appendFile(chatPath, messages.map(message => JSON.stringify(message)).join("\n") + "\n");
+const appendMessages = (chatPath: string, messages: ModelMessage[]) => 
+  appendFile(chatPath, messages.map(message => JSON.stringify(message)).join("\n") + "\n");
+
+async function askToRun(command: string) {
+  await new Promise<void>((resolve) => setImmediate(resolve)) // wait for stdout to flush
+  const prompt = `Can I run \`${command}\` (y/N)? `;
+  if (!process.stdin.isTTY) {
+    process.stderr.write(prompt);
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+    return await new Promise<string>(resolve => {
+      let answered = false;
+      rl.once("line", line => { answered = true; resolve(line); rl.close(); });
+      rl.once("close", () => { if (!answered) resolve(""); });
+    });
+  }
+  const rl = readline.promises.createInterface({ input: process.stdin, output: process.stderr });
+  const answer = await rl.question(prompt);
+  rl.close()
+  return answer;
 }
 
-function makeTools(yes = false) { return {
+const makeTools = () => ({
   useShell: tool({
     description: "Run a shell command in the current working directory and return stdout, stderr, and exit code.",
     inputSchema: z.object({
       command: z.string().describe("Shell command to run."),
     }),
-    inputExamples: [
-      {
-        input: {
-          command: `patch -p0 <<'PATCH'
---- index.ts
-+++ index.ts
-@@ -1,3 +1,3 @@
--old text
-+new text
-PATCH`,
-        },
-      },
-      {
-        input: {
-          command: `# List executable commands available on PATH, grouped by directory.
-printf '%s\\n' "$PATH" | tr ':' '\\n' | awk 'NF && !seen[$0]++' |
-while IFS= read -r d; do
-  [ -d "$d" ] || continue
-  printf '\\n%s:\\n' "$d"
-  for f in "$d"/*; do
-    [ -f "$f" ] && [ -x "$f" ] && basename "$f"
-  done | sort | sed 's/^/  /'
-done`,
-        },
-      },
-    ],
     execute: async ({ command }) => {
-      if (!yes) {
-        await new Promise<void>((resolve) => setTimeout(() => resolve(), 1)) // wait for stdout to flush
-        const rl = readline.promises.createInterface(process.stdin, process.stdout);
-        const answer = await rl.question(`Can I run \`${command}\` (Y/n)? `);
-        rl.close()
-        if (answer !== 'Y') throw new Error('Rejected by User');
-      }
+      const answer = await askToRun(command);
+      if (!/^y(es)?$/i.test(answer.trim())) throw new Error('Rejected by User');
       const proc = Bun.spawn(["sh", "-lc", command], {
         stdout: "pipe",
         stderr: "pipe",
@@ -183,59 +132,52 @@ done`,
       return { exitCode, stdout: tailText(stdout), stderr: tailText(stderr) };
     },
   }),
-}; }
+});
 
-async function runPrompt(args: { chatPath?: string; model?: string; prompt: string; yes?: boolean; newChat?: boolean }) {
+async function runPrompt(args: { chatPath?: string; model?: string; prompt: string; newChat?: boolean }) {
   const { path: chatPath, defaulted: defaultedChat } = await resolveChatPath(args.chatPath, args.newChat);
   const model = args.model ?? defaultModel;
 
   if (defaultedChat) console.error(`Using chat file: ${chatPath}`);
   if (args.model === undefined) console.error(`Using model: ${model}`);
 
-  const chat = await loadMessages(chatPath, args.prompt);
   const openrouter = createOpenRouter({ apiKey: Bun.env.OPENROUTER_API_KEY });
+  const messages = await loadMessages(chatPath, args.prompt);
   const result = streamText({
-    model: wrapLanguageModel({
-      model: openrouter(model),
-      middleware: addToolInputExamplesMiddleware(),
-    }),
-    system: `This chat lives at ${path.join(process.cwd(), chatPath)}. Read files before editing.`,
-    ...chat,
-    tools: makeTools(args.yes),
+    model: openrouter(model),
+    system: `This chat lives at ${path.join(process.cwd(), chatPath)}. Read files before editing, they might have changed.`,
+    messages,
+    tools: makeTools(),
     stopWhen: stepCountIs(100),
-    onError: () => {},
+    onError: console.error,
   });
 
-  const print = (text: string, p: WriteStream = process.stdout) => p.write(text);
-
   for await (const part of result.fullStream) {
-    if (part.type === "text-delta") print(part.text);
+    if (part.type === "text-delta") process.stdout.write(part.text);
     
-    if (part.type === "reasoning-start") print("\n<thinking>", process.stderr);
-    if (part.type === "reasoning-delta") print(part.text, process.stderr);
-    if (part.type === "reasoning-end") print("</thinking>\n", process.stderr);
+    if (part.type === "reasoning-start") process.stderr.write("\n<thinking>");
+    if (part.type === "reasoning-delta") process.stderr.write(part.text);
+    if (part.type === "reasoning-end") process.stderr.write("</thinking>\n");
 
     if (part.type === "tool-call" && part.toolName === 'useShell') 
-      print(`\n<tool> $ ${(part.input as {command: string}).command} </tool>`, process.stderr);
+      process.stderr.write(`\n<tool> $ ${(part.input as {command: string}).command} </tool>`);
     if (part.type === "tool-result") {
       const {stdout, stderr, exitCode} = (part.output as {stdout: string; stderr: string; exitCode: number})
-      if (stderr) print(`\n<tool-error>Exit ${exitCode}: ${stderr}</tool-error>`, process.stderr)
-      if (stdout) print(`\n<tool-result>${stdout}</tool-result>\n`, process.stderr);
+      if (stderr) process.stderr.write(`\n<tool-error>Exit ${exitCode}: ${stderr}</tool-error>`)
+      if (stdout) process.stderr.write(`\n<tool-result>${stdout}</tool-result>\n`);
     }
 
     if (part.type === "tool-error")
-      console.error(`\nTool ${part.toolName} failed: ${String(part.error)}`);
+      process.stderr.write(`\<tool-error> ${part.toolName} failed: ${String(part.error)}</tool-error>`);
     if (part.type === "error")
       throw part.error instanceof Error ? part.error : new Error(String(part.error));
     if (part.type === "abort")
       throw new Error(part.reason ?? "Stream aborted");
   }
   process.stdout.write("\n");
-  const [response, totalUsage] = await Promise.all([result.response, result.totalUsage]);
-  console.error(formatUsage(totalUsage));
   await appendMessages(chatPath, [
     { role: "user", content: args.prompt },
-    ...response.messages,
+    ...(await result.response).messages,
   ]);
 }
 
